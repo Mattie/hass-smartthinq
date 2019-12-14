@@ -45,13 +45,10 @@ Here's how to use this:
 Credits
 -------
 
-This is by [GuGU927][andy]. The license is [MIT][].
-
-For Korean user, visit [HomeAssistant Naver Cafe][cafe]
+This is based on code by [Adrian Sampson][sampson] and [GuGU927][andy]. The license is [MIT][].
 
 This library originated from [Adrian Sampson][sampson]
 
-[cafe]: https://cafe.naver.com/koreassistant
 [mit]: https://opensource.org/licenses/MIT
 [sampson]: https://github.com/sampsyo/hass-smartthinq
 [andy]: https://github.com/gugu927/hass-smartthinq
