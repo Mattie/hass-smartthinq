@@ -26,8 +26,14 @@ PRESET_MODES = {
     'CLOTHES': '의류건조',
 }
 FAN_MODES = {
-    'LOW': '약',
-    'HIGH': '강',
+    'LOW': c_const.FAN_LOW,
+    'LOW_MID': 'low-mid',
+    'MID': c_const.FAN_MEDIUM,
+    'MID_HIGH': 'mid-high',
+    'HIGH': c_const.FAN_HIGH,
+
+    'NATURE': 'nature',
+    'POWER': 'power',
 }
 
 REQUIREMENTS = ['wideq']
@@ -376,29 +382,28 @@ class LGDehumDevice(LGDevice, ClimateDevice):
         if getattr(self._dehumidifier, 'mon', None) is None:
             self._restart_monitor()
 
-        try:
-            status = self._dehumidifier.poll()
-        except wideq.NotConnectedError:
-            self._status = None
-            return
-        except wideq.NotLoggedInError:
-            LOGGER.info('Session expired. Refreshing.')
-            self._client.refresh()
-            self._restart_monitor()
-            return
+            try:
+                state = self._ac.poll()
+            except wideq.NotLoggedInError:
+                LOGGER.info('Session expired. Refreshing.')
+                self._client.refresh()
+                self._ac.monitor_start()
+                continue
+            except wideq.NotConnectedError:
+                LOGGER.info('Device not available.')
+                return
 
-        if status:
-            LOGGER.debug('Status updated.')
-            self._status = status
-            self._failed_request_count = 0
-            return
+            if state:
+                LOGGER.info('Status updated.')
+                self._state = state
+                return
 
-        LOGGER.debug('No status available yet.')
-        self._failed_request_count += 1
+            LOGGER.info('No status available yet.')
+            time.sleep(2 ** iteration)  # Exponential backoff.
 
-        if self._failed_request_count >= MAX_RETRIES:
-            # We tried several times but got no result. This might happen
-            # when the monitoring request gets into a bad state, so we
-            # restart the task.
-            self._restart_monitor()
-            self._failed_request_count = 0
+        # We tried several times but got no result. This might happen
+        # when the monitoring request gets into a bad state, so we
+        # restart the task.
+        LOGGER.warn('Status update failed.')
+        self._ac.monitor_start()
+
