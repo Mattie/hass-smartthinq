@@ -1,31 +1,29 @@
 import logging
-import voluptuous as vol
-from homeassistant.components import climate
-from homeassistant.const import CONF_REGION, CONF_TOKEN
-import homeassistant.helpers.config_validation as cv
-from homeassistant import const
 import time
+import voluptuous as vol
+import homeassistant.helpers.config_validation as cv
+
+from homeassistant import const
+from homeassistant.const import CONF_REGION, CONF_TOKEN
+from homeassistant.components import climate
+from homeassistant.components.climate import ClimateDevice
 from homeassistant.components.climate import const as c_const
 from custom_components.smartthinq import (
-    CONF_LANGUAGE, DEPRECATION_WARNING, KEY_DEPRECATED_COUNTRY,
-    KEY_DEPRECATED_LANGUAGE, KEY_DEPRECATED_REFRESH_TOKEN)
+    CONF_LANGUAGE, KEY_SMARTTHINQ_DEVICES, LGDevice)
 
-REQUIREMENTS = ['wideq']
+KEY_DH_ON = 'on'
+KEY_DH_OFF = 'off'
 
-LOGGER = logging.getLogger(__name__)
-
-PLATFORM_SCHEMA = climate.PLATFORM_SCHEMA.extend({
-    vol.Required(KEY_DEPRECATED_REFRESH_TOKEN): cv.string,
-    KEY_DEPRECATED_COUNTRY: cv.string,
-    KEY_DEPRECATED_LANGUAGE: cv.string,
-})
-
-MODES = {
-    'HEAT': c_const.HVAC_MODE_HEAT,
-    'COOL': c_const.HVAC_MODE_COOL,
-    'FAN': c_const.HVAC_MODE_FAN_ONLY,
+HVAC_MODES = {
     'DRY': c_const.HVAC_MODE_DRY,
-    'ACO': c_const.HVAC_MODE_HEAT_COOL,
+    'OFF': c_const.HVAC_MODE_OFF,
+}
+PRESET_MODES = {
+    'SMART': '스마트제습',
+    'SPEED': '쾌속제습',
+    'SILENT': '저소음제습',
+    'FOCUS': '집중건조',
+    'CLOTHES': '의류건조',
 }
 FAN_MODES = {
     'LOW': c_const.FAN_LOW,
@@ -38,216 +36,351 @@ FAN_MODES = {
     'POWER': 'power',
 }
 
+REQUIREMENTS = ['wideq']
+import wideq
+from wideq import dehum
+
+LOGGER = logging.getLogger(__name__)
+
+ATTR_DH_STATE = 'state'
+ATTR_DH_AIRREMOVAL_MODE = 'airremoval_mode'
+ATTR_DH_FAN_MODE = 'fan_mode'
+ATTR_DH_FAN_MODES = 'fan_modes'
+ATTR_DH_PRESET_MODE = 'preset_mode'
+ATTR_DH_PRESET_MODES = 'preset_modes'
+ATTR_DH_HVAC_MODE = 'hvac_mode'
+ATTR_DH_HVAC_MODES = 'hvac_modes'
+ATTR_DH_HUMIDITY = 'humidity'
+ATTR_DH_TARGET_HUMIDITY = 'target_humidity'
+ATTR_DH_MIN_HUMIDITY = 'min_humidity'
+ATTR_DH_MAX_HUMIDITY = 'max_humidity'
+
 MAX_RETRIES = 5
-TRANSIENT_EXP = 5.0  # Report set temperature for 5 seconds.
-TEMP_MIN_F = 60  # Guessed from actual behavior: API reports are unreliable.
-TEMP_MAX_F = 89
-TEMP_MIN_C = 18  # Intervals read from the AC's remote control.
-TEMP_MAX_C = 30
+TRANSIENT_EXP = 5.0  # Report set temperature / humidity for 5 seconds.
+HUM_MIN = 30
+HUM_MAX = 70
+HUM_STEP = 5
 
+async def async_setup_platform(hass, config, add_devices, discovery_info=None):
+    """Set up the LG entities"""
 
-def setup_platform(hass, config, add_devices, discovery_info=None):
-    import wideq
+    refresh_token = hass.data[CONF_TOKEN]
+    region = hass.data[CONF_REGION]
+    language = hass.data[CONF_LANGUAGE]
 
-    if any(key in config for key in (
-        (KEY_DEPRECATED_REFRESH_TOKEN,
-         KEY_DEPRECATED_COUNTRY,
-         KEY_DEPRECATED_LANGUAGE))):
-        LOGGER.warning(DEPRECATION_WARNING)
+    client = wideq.Client.from_token(refresh_token, region, language)
+    dehumidifiers = []
 
-    refresh_token = config.get(KEY_DEPRECATED_REFRESH_TOKEN) or \
-        hass.data.get(CONF_TOKEN)
-    country = config.get(KEY_DEPRECATED_COUNTRY) or \
-        hass.data.get(CONF_REGION)
-    language = config.get(KEY_DEPRECATED_LANGUAGE) or \
-        hass.data.get(CONF_LANGUAGE)
+    for device_id in hass.data[KEY_SMARTTHINQ_DEVICES]:
+        device = client.get_device(device_id)
+        LOGGER.debug("Device: %s" % device.type)
 
-    fahrenheit = hass.config.units.temperature_unit != '°C'
-
-    client = wideq.Client.from_token(refresh_token, country, language)
-    add_devices(_ac_devices(hass, client, fahrenheit), True)
-
-
-def _ac_devices(hass, client, fahrenheit):
-    """Generate all the AC (climate) devices associated with the user's
-    LG account.
-
-    Log errors for devices that can't be used for whatever reason.
-    """
-    import wideq
-
-    persistent_notification = hass.components.persistent_notification
-
-    for device in client.devices:
-        if device.type == wideq.DeviceType.AC:
+        if device.type == wideq.DeviceType.DEHUMIDIFIER:
+            base_name = "lg_dehumidifier_" + device.name
+            LOGGER.debug("Creating new LG Dehumidifier: %s" % base_name)
             try:
-                d = LGDevice(client, device, fahrenheit)
+                dehumidifiers.append(LGDehumDevice(client, device, base_name))
             except wideq.NotConnectedError:
-                LOGGER.error(
-                    'SmartThinQ device not available: %s', device.name
-                )
-                persistent_notification.async_create(
-                    'SmartThinQ device not available: %s' % device.name,
-                    title='SmartThinQ Error',
-                )
-            else:
-                yield d
+                # Dehumidifier are only connected when in use. Ignore
+                # NotConnectedError on platform setup.
+                pass
 
+    if dehumidifiers:
+        add_devices(dehumidifiers, True)
 
-class LGDevice(climate.ClimateDevice):
-    def __init__(self, client, device, fahrenheit=True):
-        self._client = client
-        self._device = device
-        self._fahrenheit = fahrenheit
+class LGDehumDevice(LGDevice, ClimateDevice):
+    def __init__(self, client, device, name):
+        """Initialize an LG Dehumidifier Device."""
 
-        import wideq
-        self._ac = wideq.ACDevice(client, device)
-        self._ac.monitor_start()
+        super().__init__(client, device)
 
-        # The response from the monitoring query.
-        self._state = None
-
-        # Store a transient temperature when we've just set it. We also
-        # store the timestamp for when we set this value.
-        self._transient_temp = None
+        # This constructor is called during platform creation. It must not
+        # involve any API calls that actually need the dehumidifier to be
+        # connected, otherwise the device construction will fail and the entity
+        # will not get created. Specifically, calls that depend on dehumidifier
+        # interaction should only happen in update(...), including the start of
+        # the monitor task.
+        self._dehumidifier = dehum.DehumDevice(client, device)
+        self._name = name
+        self._status = None
+        self._transient_humi = None
         self._transient_time = None
-
-    @property
-    def temperature_unit(self):
-        if self._fahrenheit:
-            return const.TEMP_FAHRENHEIT
-        else:
-            return const.TEMP_CELSIUS
+        self._failed_request_count = 0
 
     @property
     def name(self):
-        return self._device.name
+        return self._name
+
+    @property
+    def is_on(self):
+        if self._status:
+            return self._status.is_on
+        return False
+
+    @property
+    def device_type(self):
+        return self._type
 
     @property
     def available(self):
         return True
 
+    async def async_turn_on(self):
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            LOGGER.info('Turn On %s', self.name)
+            await self.async_update_ha_state()
+
+    async def async_turn_off(self) :
+        if self._status:
+            if self._status.is_on:
+                self._dehumidifier.set_on(False)
+            LOGGER.info('Turn Off %s', self.name)
+            await self.async_update_ha_state()
+
+        # Fake turn off
+        if c_const.HVAC_MODE_OFF in self.hvac_modes:
+            await self.async_set_hvac_mode(c_const.HVAC_MODE_OFF)
+
     @property
     def supported_features(self):
         return (
-            c_const.SUPPORT_TARGET_TEMPERATURE |
+            c_const.SUPPORT_TARGET_HUMIDITY |
+            c_const.SUPPORT_PRESET_MODE |
             c_const.SUPPORT_FAN_MODE
         )
 
     @property
+    def state_attributes(self):
+        """Return the optional state attributes."""
+        data = {}
+        data[ATTR_DH_STATE] = self.state
+        data[ATTR_DH_AIRREMOVAL_MODE] = self.is_airremoval_mode
+        data[ATTR_DH_FAN_MODE] = self.fan_mode
+        data[ATTR_DH_FAN_MODES] = self.fan_modes
+        data[ATTR_DH_PRESET_MODE] = self.preset_mode
+        data[ATTR_DH_PRESET_MODES] = self.preset_modes
+        data[ATTR_DH_HVAC_MODE] = self.hvac_mode
+        data[ATTR_DH_HVAC_MODES] = self.hvac_modes
+        data[ATTR_DH_HUMIDITY] = self.current_humidity
+        data[ATTR_DH_TARGET_HUMIDITY] = self.target_humidity
+        data[ATTR_DH_MIN_HUMIDITY] = self.min_humidity
+        data[ATTR_DH_MAX_HUMIDITY] = self.max_humidity
+
+        return data
+
+    @property
+    def precision(self):
+        return const.PRECISION_WHOLE
+
+    @property
+    def temperature_unit(self):
+        return const.TEMP_CELSIUS
+
+    @property
+    def state(self):
+        if self._status and self._status.state == '켜짐':
+            return KEY_DH_ON
+        return KEY_DH_OFF
+
+    @property
     def min_temp(self):
-        if self._fahrenheit:
-            return TEMP_MIN_F
-        else:
-            return TEMP_MIN_C
+        return HUM_MIN
 
     @property
     def max_temp(self):
-        if self._fahrenheit:
-            return TEMP_MAX_F
-        else:
-            return TEMP_MAX_C
+        return HUM_MAX
+
+    @property
+    def min_humidity(self):
+        return HUM_MIN
+
+    @property
+    def max_humidity(self):
+        return HUM_MAX
+
+    @property
+    def current_humidity(self):
+        return self._status.current_humidity if self._status else 0
+
+    @property
+    def target_humidity(self):
+        # Use the recently-set target temperature if it was set recently
+        # (within TRANSIENT_EXP seconds ago).
+        if self._transient_humi:
+            interval = time.time() - self._transient_time
+            if interval < TRANSIENT_EXP:
+                return self._transient_humi
+            else:
+                self._transient_humi = None
+
+        # Otherwise, actually use the device's state.
+        return self._status.target_humidity if self._status else 0
 
     @property
     def current_temperature(self):
-        if self._state:
-            if self._fahrenheit:
-                return self._state.temp_cur_f
-            else:
-                return self._state.temp_cur_c
+        return self._status.current_humidity if self._status else 0
 
     @property
     def target_temperature(self):
         # Use the recently-set target temperature if it was set recently
         # (within TRANSIENT_EXP seconds ago).
-        if self._transient_temp:
+        if self._transient_humi:
             interval = time.time() - self._transient_time
             if interval < TRANSIENT_EXP:
-                return self._transient_temp
+                return self._transient_humi
             else:
-                self._transient_temp = None
+                self._transient_humi = None
 
         # Otherwise, actually use the device's state.
-        if self._state:
-            if self._fahrenheit:
-                return self._state.temp_cfg_f
-            else:
-                return self._state.temp_cfg_c
+        return self._status.target_humidity if self._status else 0
+
+    @property
+    def target_temperature_low(self):
+        return HUM_MIN
+
+    @property
+    def target_temperature_high(self):
+        return HUM_MAX
+
+    @property
+    def target_temperature_step(self):
+        """Return the supported step of target temperature."""
+        return HUM_STEP
+
+    @property
+    def preset_mode(self):
+        if self._status:
+            if not self._status.is_on:
+                return c_const.HVAC_MODE_OFF
+            return self._status.mode
+        return c_const.HVAC_MODE_OFF
+
+    @property
+    def preset_modes(self):
+        return list(PRESET_MODES.values())
+
+    @property
+    def hvac_mode(self):
+        if self._status:
+            if not self._status.is_on:
+                return c_const.HVAC_MODE_OFF
+            return c_const.HVAC_MODE_DRY
+        return c_const.HVAC_MODE_OFF
 
     @property
     def hvac_modes(self):
-        return list(MODES.values()) + [c_const.HVAC_MODE_OFF]
+        return list(HVAC_MODES.values())
+
+    @property
+    def fan_mode(self):
+        if self._status:
+            if not self._status.is_on:
+                return c_const.HVAC_MODE_OFF
+            return self._status.windstrength_state
+        return c_const.HVAC_MODE_OFF
 
     @property
     def fan_modes(self):
         return list(FAN_MODES.values())
 
-    @property
-    def hvac_mode(self):
-        if self._state:
-            if not self._state.is_on:
-                return c_const.HVAC_MODE_OFF
-            mode = self._state.mode
-            return MODES[mode.name]
-
-    @property
-    def fan_mode(self):
-        mode = self._state.fan_speed
-        return FAN_MODES[mode.name]
-
-    def set_hvac_mode(self, hvac_mode):
-        if hvac_mode == c_const.HVAC_MODE_OFF:
-            self._ac.set_on(False)
+    async def async_set_preset_mode(self, preset_mode):
+        if preset_mode == c_const.HVAC_MODE_OFF:
+            self._dehumidifier.set_on(False)
             return
 
-        # Some AC units must be powered on before setting the mode.
-        if not self._state.is_on:
-            self._ac.set_on(True)
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            LOGGER.info('Setting mode to %s...', preset_mode)
+            self._dehumidifier.set_mode(preset_mode)
+            LOGGER.info('Mode set.')
+            await self.async_update_ha_state()
 
-        import wideq
+    async def async_set_hvac_mode(self, hvac_mode):
+        if hvac_mode == c_const.HVAC_MODE_OFF:
+            self._dehumidifier.set_on(False)
+            return
 
-        # Invert the modes mapping.
-        modes_inv = {v: k for k, v in MODES.items()}
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            if hvac_mode == 'dry':
+                value = '스마트제습'
+            LOGGER.info('Setting mode to %s...', value)
+            self._dehumidifier.set_mode(value)
+            LOGGER.info('Mode set.')
+            await self.async_update_ha_state()
 
-        mode = wideq.ACMode[modes_inv[hvac_mode]]
-        LOGGER.info('Setting mode to %s...', mode)
-        self._ac.set_mode(mode)
-        LOGGER.info('Mode set.')
+    async def async_set_fan_mode(self, fan_mode):
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            LOGGER.info('Setting fan mode to %s', fan_mode)
+            self._dehumidifier.set_windstrength(fan_mode)
+            LOGGER.info('Fan mode set.')
+            await self.async_update_ha_state()
 
-    def set_fan_mode(self, fan_mode):
-        import wideq
+    @property
+    def is_airremoval_mode(self):
+        if self._status:
+            return self._status.airremoval_state
+        return c_const.HVAC_MODE_OFF
 
-        # Invert the fan modes mapping.
-        fan_modes_inv = {v: k for k, v in FAN_MODES.items()}
+    def airremoval_mode(self, airremoval_mode):
+        if airremoval_mode == '켜짐':
+            self._dehum.set_airremoval(True)
+        elif airremoval_mode == '꺼짐':
+            self._dehum.set_airremoval(False)
 
-        mode = wideq.ACFanSpeed[fan_modes_inv[fan_mode]]
-        LOGGER.info('Setting fan mode to %s', fan_mode)
-        self._ac.set_fan_speed(mode)
-        LOGGER.info('Fan mode set.')
-
-    def set_temperature(self, **kwargs):
+    async def async_set_temperature(self, **kwargs):
         temperature = kwargs['temperature']
-        self._transient_temp = temperature
+        self._transient_humi = temperature
         self._transient_time = time.time()
 
-        LOGGER.info('Setting temperature to %s...', temperature)
-        if self._fahrenheit:
-            self._ac.set_fahrenheit(temperature)
-        else:
-            self._ac.set_celsius(temperature)
-        LOGGER.info('Temperature set.')
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            LOGGER.info('Setting temperature to %s...', temperature)
+            self._dehumidifier.set_humidity(temperature)
+            LOGGER.info('Temperature set.')
+            await self.async_update_ha_state()
+
+    async def async_set_humidity(self, **kwargs):
+        humidity = kwargs['humidity']
+        self._transient_humi = humidity
+        self._transient_time = time.time()
+
+        if self._status:
+            if not self._status.is_on:
+                self._dehumidifier.set_on(True)
+            LOGGER.info('Setting humidity to %s...', humidity)
+            self._dehumidifier.set_humidity(humidity)
+            LOGGER.info('Humidity set.')
+            await self.async_update_ha_state()
+
+    def _restart_monitor(self):
+        try:
+            self._dehumidifier.monitor_start()
+        except wideq.NotConnectedError:
+            self._status = None
+        except wideq.NotLoggedInError:
+            LOGGER.info('Session expired. Refreshing.')
+            self._client.refresh()
 
     def update(self):
-        """Poll for updated device status.
+        """Poll for dehumidifier state updates."""
 
-        Set the `_state` field to a new data mapping.
-        """
+        # This method is polled, so try to avoid sleeping in here. If an error
+        # occurs, it will naturally be retried on the next poll.
 
-        import wideq
+        LOGGER.debug('Updating %s.', self.name)
 
-        LOGGER.info('Updating %s.', self.name)
-        for iteration in range(MAX_RETRIES):
-            LOGGER.info('Polling...')
+        # On initial construction, the dehumidifier monitor task
+        # will not have been created. If so, start monitoring here.
+        if getattr(self._dehumidifier, 'mon', None) is None:
+            self._restart_monitor()
 
             try:
                 state = self._ac.poll()
@@ -273,3 +406,4 @@ class LGDevice(climate.ClimateDevice):
         # restart the task.
         LOGGER.warn('Status update failed.')
         self._ac.monitor_start()
+
